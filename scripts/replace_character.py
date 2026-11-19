@@ -555,6 +555,10 @@ def wrap_other_arguments(output_path):
         # derivation to zero clauses (the assert became unreachable).
         if re.fullmatch(r'litcond_\w+', elem):
             return f"var({elem})"
+        # Shared return locals of functions with several returns
+        # (generate_facts.py retval_synth_name()).
+        if re.fullmatch(r'retval_\d+', elem):
+            return f"var({elem})"
         if re.fullmatch(r'0x[0-9a-fA-F]+', elem):
             return f"num({elem})"
         return elem
@@ -720,4 +724,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
+    

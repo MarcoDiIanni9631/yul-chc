@@ -21,6 +21,31 @@ def literal_cond_synth_name(block_id):
     return f"litcond_{block_id}"
 
 
+# A function with several `return`s gives one FunctionReturn block per return,
+# each returning its own SSA variable (e.g. v10 in the if branch, v9 in the
+# else branch). All of them used to get the same label <fun>_ret, so the
+# interpreter's fun_call_epilogue (at(F_ret, ret(Vs))) could pair a path with
+# the ret of another branch and return a stale value: false positives /
+# missed bugs. For such functions every return block now copies its values
+# into shared locals retval_0..retval_{k-1} and there is one single
+# at(<fun>_ret, ret([retval_0, ...])).
+def multi_return_arity(blocks):
+    """Number of return values if the blocks hold 2+ different FunctionReturn
+    value lists, else 0 (nothing to change)."""
+    rets = set()
+    for block in blocks:
+        exit_info = block.get('exit', {})
+        if exit_info.get('type') == 'FunctionReturn':
+            rets.add(tuple(exit_info.get('returnValues', [])))
+    if len(rets) < 2:
+        return 0
+    return max(len(r) for r in rets)
+
+
+def retval_synth_name(i):
+    return f"retval_{i}"
+
+
 def extract_signatures(contract_data):
     signatures = []
     Zero = "0" * 56  
@@ -193,6 +218,8 @@ def parse_yul_ir(file_path):
             if exit_info.get("type") == "ConditionalJump" and cond is not None \
                and LITERAL_COND_RE.match(str(cond)):
                 local_vars.add(literal_cond_synth_name(block["id"]))
+        for i in range(multi_return_arity(blocks)):
+            local_vars.add(retval_synth_name(i))
         return list(local_vars)
     
     
@@ -219,6 +246,31 @@ def parse_yul_ir(file_path):
 
         last_cj_index = None
 
+        mr_arity = multi_return_arity(blocks)
+        mr_ret_emitted = False
+
+        def emit_multi_return(block_label_prefix, start_index, return_values, last_label):
+            """Copies the block's return values into retval_i, then goes to the
+            single <prefix>_ret. The first copy label is <block>_<start_index>,
+            i.e. the label a cj/goto into this block already points to."""
+            nonlocal mr_ret_emitted
+            ret_label = f"{prefix}_ret"
+            idx = start_index
+            for i, rv in enumerate(return_values):
+                label = f"{block_label_prefix}_{idx}"
+                at_clauses.append(f"at(\"{label}\", asgn(var({retval_synth_name(i)}), expr(add([{rv}, 0x00]))))." )
+                if last_label:
+                    nextlab_clauses.append(f"nextlab(\"{last_label}\", \"{label}\").")
+                last_label = label
+                idx += 1
+            if last_label:
+                nextlab_clauses.append(f"nextlab(\"{last_label}\", \"{ret_label}\").")
+            if not mr_ret_emitted:
+                rets = ','.join(retval_synth_name(i) for i in range(mr_arity))
+                at_clauses.append(f"at(\"{ret_label}\", ret([{rets}])).")
+                mr_ret_emitted = True
+            return ret_label
+
         for block in blocks:
             block_id = block['id']
             instructions = block.get('instructions', [])
@@ -231,7 +283,10 @@ def parse_yul_ir(file_path):
 
 
             # If there are no instructions, it still generates a ret clause
-            if not instructions and exit_info.get('type') != 'Jump':
+            if not instructions and exit_info.get('type') == 'FunctionReturn' and mr_arity:
+                last_cj_index = None
+                last_label = emit_multi_return(block_label_prefix, 1, return_values, None)
+            elif not instructions and exit_info.get('type') != 'Jump':
                 #ret_label = f"{block_label_prefix}_1"
                 ret_label = f"{prefix}_ret"
 
@@ -349,6 +404,10 @@ def parse_yul_ir(file_path):
                     if last_label:
                         nextlab_clauses.append(f"nextlab(\"{last_label}\", \"{jump_label}\").")
                     last_label = jump_label
+
+                elif exit_info.get('type') == 'FunctionReturn' and mr_arity:
+                    last_cj_index = None
+                    last_label = emit_multi_return(block_label_prefix, len(instructions) + 1, return_values, last_label)
 
                 elif exit_info.get('type') == 'FunctionReturn':
                     not_ret_label = f"{block_label_prefix}_{len(instructions) + 1}"
