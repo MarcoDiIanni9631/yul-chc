@@ -544,6 +544,17 @@ def wrap_other_arguments(output_path):
             return elem
         if re.fullmatch(r'v\d+', elem):
             return f"var({elem})"
+        # Synthetic variable materialized by generate_facts.py's
+        # literal_cond_synth_name() for a ConditionalJump whose condition
+        # GREY folded down to a raw literal (e.g. "if (true)" with no/empty
+        # else branch). It doesn't match the v\d+ SSA-temp shape above, so
+        # without this it was left as a bare atom instead of var(...) inside
+        # fun(...) local-var lists -- the interpreter's fun_call_prologue
+        # expects every local var there to be a var(_) term, so the bare
+        # atom made the call's prologue fail outright, collapsing the whole
+        # derivation to zero clauses (the assert became unreachable).
+        if re.fullmatch(r'litcond_\w+', elem):
+            return f"var({elem})"
         if re.fullmatch(r'0x[0-9a-fA-F]+', elem):
             return f"num({elem})"
         return elem

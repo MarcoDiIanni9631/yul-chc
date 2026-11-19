@@ -45,10 +45,34 @@ is_unfoldable(Ctx,B) :- is_callable(Ctx,B).
 
 %
 is_unfoldable(_Ctx,errorConf(_,_)).
+
+% A function is "inline safe" when it is called from exactly one call site in
+% the whole program, and that call site is not inside the function's own body
+% (so a single unfolding pass through it cannot be directly recursive).
+% Inlining such a call instead of folding it into a fresh, unconstrained
+% (constr_tt/true) reusable definition preserves the caller's constraints on
+% the actual argument values. Folding every fun_call unconditionally is sound
+% and necessary for loops/recursion, but for a call site reached exactly once
+% it needlessly loses precision (e.g. branches(1): the "1" was discarded
+% because branches() was folded into a generic, argument-free predicate).
+label_belongs_to(F,Label) :-
+    atom_concat(F,'_',Prefix),
+    sub_atom(Label,0,_,_,Prefix).
+%
+inline_safe_entry(Ep) :-
+    inprog:fun(F,_,_,Ep),
+    findall(Label, inprog:at(Label,fun_call(F,_,_)), Labels),
+    ( Labels = [OnlyLabel], \+ label_belongs_to(F,OnlyLabel)
+    -> format(user_error,"~n@@@SAFE F=~w Ep=~w YES~n",[F,Ep])
+    ;  format(user_error,"~n@@@SAFE F=~w Ep=~w NO (labels=~w)~n",[F,Ep,Labels]),
+       fail
+    ).
+
 % -- reachable -----------------------------------------------------------------
 is_unfoldable(_Ctx,reachable(Cf1,_Cf2)) :-
-    Cf1 = cf(cmd(Ep,_),_), 
+    Cf1 = cf(cmd(Ep,_),_),
     inprog:fun(_,_,_,Ep), getCmdType(Cf1,Cmd), Cmd \== ret,
+    \+ inline_safe_entry(Ep),
     !,
     fail.
 is_unfoldable(_Ctx,reachable(Cf1,_Cf2)) :-

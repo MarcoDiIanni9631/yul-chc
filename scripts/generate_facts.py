@@ -1,5 +1,25 @@
 import json
+import re
 import sys
+
+# A ConditionalJump's condition is normally a Yul SSA variable (vN). But GREY
+# sometimes folds it down to a raw compile-time literal (e.g. "0x01" for
+# `if (true)` when the untaken alternative branch is empty) and writes it
+# straight into the cj fact as cj(var(0x01), ...). That "variable" was never
+# produced by any instruction, so extract_local_vars never gives it an
+# environment slot (build_funenv in the interpreter only creates a slot for
+# names listed there), and the interpreter can't resolve it when evaluating
+# the jump -- the branch containing the assert becomes silently unreachable,
+# regardless of what it actually asserts. LITERAL_COND_RE detects this shape
+# so both extract_local_vars and process_blocks can materialize it into a
+# real tracked variable (via subO_identity, the same way literals become
+# variables everywhere else in this codebase) instead of leaving it orphaned.
+LITERAL_COND_RE = re.compile(r'^0[xX][0-9a-fA-F]+$')
+
+
+def literal_cond_synth_name(block_id):
+    return f"litcond_{block_id}"
+
 
 def extract_signatures(contract_data):
     signatures = []
@@ -168,6 +188,11 @@ def parse_yul_ir(file_path):
             for instr in block.get("instructions", []):
                 for var in instr.get("out", []):
                     local_vars.add(var)
+            exit_info = block.get("exit", {})
+            cond = exit_info.get("cond")
+            if exit_info.get("type") == "ConditionalJump" and cond is not None \
+               and LITERAL_COND_RE.match(str(cond)):
+                local_vars.add(literal_cond_synth_name(block["id"]))
         return list(local_vars)
     
     
@@ -180,7 +205,7 @@ def parse_yul_ir(file_path):
 
         builtin_ops = { "memoryguard", "caller", "calldatasize", "calldataload", "callvalue",
                        "datasize", "dataoffset", "sload", "not", "shl", "address",
-                       "balance", "slt", "mload", "iszero", "lt", "gt", "eq", "neq",
+                       "balance", "slt", "sgt", "mload", "iszero", "lt", "gt", "eq", "neq",
                        "shr", "add", "sub", "mul", "div", "mod", "and", "or", "xor", 
                        "returndatasize", "gas", "extcodesize", 
                        "codesize", "extcodecopy", "extcodehash", "log0", "timestamp" , "create2",
@@ -309,6 +334,14 @@ def parse_yul_ir(file_path):
                     true_target = f"{prefix}_{exit_info['targets'][0]}_1"
                     false_target = f"{prefix}_{exit_info['targets'][1]}_1"
                     jump_label = f"{block_label_prefix}_jump"
+                    if LITERAL_COND_RE.match(str(cond)):
+                        synth = literal_cond_synth_name(block_id)
+                        lit_label = f"{jump_label}_lit"
+                        at_clauses.append(f"at(\"{lit_label}\", asgn(var({synth}), expr(add([num({cond}), num(0x00)])))).")
+                        if last_label:
+                            nextlab_clauses.append(f"nextlab(\"{last_label}\", \"{lit_label}\").")
+                        last_label = lit_label
+                        cond = synth
                     at_clauses.append(f"at(\"{jump_label}\", cj(var({cond}), \"{true_target}\", \"{false_target}\")).")
 
                     last_cj_index = len(at_clauses) - 1 
